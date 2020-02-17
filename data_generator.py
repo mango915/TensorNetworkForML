@@ -16,8 +16,8 @@ def create_dataset(n_samples, linear_dim=5, sigma=0.5, prob_zero=0.5):
     prob_zero : float in [0,1], 
         probability that an image is created according to pattern 0
         
-    Return
-    ------
+    Returns
+    -------
     data : numpy array of floats in [0,1] of shape (n_samples, linear_dim, linear_dim)
         array of greyscale images
     labels : numpy array of int of length n_samples
