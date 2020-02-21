@@ -602,7 +602,7 @@ class Network():
     where all the tensors are contracted both to the left and to the right.
     """
     
-    def __init__(self, N, M, D=2, L=10, normalize=False):
+    def __init__(self, N, M, D=2, L=10, normalize=False, calibration_X=None):
         """
         Parameters
         ----------
@@ -618,6 +618,8 @@ class Network():
         normalize: bool 
             If True, normalizes the weights so that the expected output is of order 1
             for inputs X with all entries in [0,1]
+        calibration_X: numpy array
+            Shape (batch_size, N, D)
         """
         
         self.N = N
@@ -644,17 +646,34 @@ class Network():
         self.l_pos = 0
         
         if normalize:
-            B = 16
-            X = np.random.random((B, self.N, self.D))
+            if calibration_X is None:
+                B = 16 # batch size of the samples used for calibration
+                X = np.random.random((B, self.N))
+                print(X.shape)
+                def psi(x):
+                    x = np.array((np.sin(np.pi*x/2),np.cos(np.pi*x/2)))
+                    return np.transpose(x, [1,2,0])
+                X = psi(X)
+            else:
+                X = calibration_X
+                B = X.shape[2]
+            
+            print(X.shape)
             f = self.forward(X)
             f_max = np.abs(f.elem).max().astype('float')
             print('f_max for random input of %d samples : '%(B),f_max)
             F2 = f_max**(1./self.N)
+            print("F2: ", F2)
+            sum_of_A = 0 # debug
             for i in range(self.N):
+                #self.As[i].elem = copy.deepcopy(self.As[i].elem)/F2
                 self.As[i].elem = self.As[i].elem/F2
+                sum_of_A += self.As[i].elem.sum() # debug
+            print("Sum of all elements of all As (after init): ", sum_of_A) # debug
             f = self.forward(X)  
             f_max = np.abs(f.elem).max().astype('float')
             print('f_max for random input of %d samples (after): '%(B),f_max)
+            
             
         return
         
@@ -694,6 +713,14 @@ class Network():
         #     * multithread
                       
         #A_TX = np.vectorize(contract)(TX, A, contracted='d'+str(i))
+        
+        ##############################################################################
+        #sum_of_A = 0 # debug
+        #for i in range(self.N):
+        #        sum_of_A += self.As[i].elem.sum() # debug
+        #print("Sum of all elements of all As (before forward): ", sum_of_A) # debug
+        ##############################################################################
+        
         A_TX = [contract(self.As[i], TX[i], contracted='d'+str(i)) for i in range(self.N)]
         cum_contraction = []
         cum_contraction.append(A_TX[-1])
@@ -744,6 +771,8 @@ class Network():
             print_every = int(len(train_loader)/print_freq)
             for i, data in enumerate(train_loader, 0):
                 x = np.array([data[i][0] for i in range(len(data))])
+                #f_debug = self.forward(x)
+                #print("f_debug.elem: ", f_debug.elem)  # incorrect of 10^-11 order
                 y = np.array([data[i][1] for i in range(len(data))])
                 f = self.sweep(x, y, lr)
                 batch_acc = self.accuracy(x, y, f)
@@ -821,16 +850,22 @@ class Network():
         
         batch_size = len(y)
         f = self.forward(X)
-
         #print("Target: \n", y)
         one_hot_y = np.zeros((y.size, self.L))
         one_hot_y[np.arange(y.size),y] = 1
         y = one_hot_y.T
         
         for i in range(self.N-1):
-            #print("\nsweep step ",i)
+            print("\nsweep step ",i)
             f = self.sweep_step(f, y, lr, batch_size)
+            ####################
+            #sum_of_A = 0 # debug
+            #for i in range(self.N):
+            #        sum_of_A += self.As[i].elem.sum() # debug
+            #print("Sum of all elements of all As (before forward): ", sum_of_A) # debug
+            ####################
             
+        ### ERROR IN THIS PART ###
         # svd 
         B = contract(self.As[-1], self.As[0], "right", "left")
         # reconstruct optimized network tensors
@@ -838,7 +873,8 @@ class Network():
         B.aggregate(axes_names=['d0','right','l'], new_ax_name='j')
         B.transpose(['i','j'])
         self.As[-1], self.As[0] = tensor_svd(B)
-
+        ##########################
+        
         self.l_pos = 0
         return f
     
@@ -906,12 +942,21 @@ class Network():
             # tensor product with broadcasting on batch axis
             phi = contract(phi, self.left_contraction, common = "b")
             
+        ######################################################
         y_pred = np.argmax(f.elem, axis=0) 
-        #print('Predictions before sweep step: \n', y_pred) 
-        #print('f.elem.shape: ', f.elem.shape)
-        #print('y.shape: ', y.shape)
+        y_target = np.argmax(y, axis=0) 
+        #print("Target: ", y_target)
+        #print("Prediction (before optim.): ", y_pred)
+        
+        errors = (y_target!=y_pred).sum()
+        accuracy = (len(y_pred)-errors)/len(y_pred)
+        MSE = ((y-f.elem)**2).mean()
+        print("Accuracy (before optim.): ", accuracy)
+        print("MSE (before optim.): ", MSE)
+        ######################################################
+        
         f.elem = y-f.elem
-        #print('(y-f).elem.shape: ', f.elem.shape)
+  
         deltaB = contract(f, phi, contracted="b")
         # gradient clipping
         if np.abs(deltaB.elem).sum() > 1000:
@@ -926,7 +971,9 @@ class Network():
         debug = False
         if debug:
             print('\nB.elem.sum(): ', B.elem.sum())
-            print('deltaB.elem.sum(): ', deltaB.elem.sum())
+        print('deltaB.elem.sum(): ', deltaB.elem.sum())
+        # just trying to regularize
+        B.elem *= (1-lr)
         B = B + deltaB
         if debug:
             print('B.elem.sum() (after update): ', B.elem.sum())
@@ -942,9 +989,19 @@ class Network():
             out = contract(self.left_contraction, out, 'right', 'left', common = "b")
         
         out = partial_trace(out, 'right', 'left') # close the circle
-        
+        if debug:
+            print("Shape of the outputs: ", out.elem.shape)
+            print("Total sum of the outputs: ", np.abs(out.elem).sum())
+           
+        ######################################################
         y_pred = np.argmax(out.elem, axis=0) 
-        #print('Predictions after sweep step: \n', y_pred) 
+        #print("Prediction (after optim.): ", y_pred)
+        errors = (y_target!=y_pred).sum()
+        accuracy = (len(y_pred)-errors)/len(y_pred)
+        MSE = ((y-out.elem)**2).mean()
+        print("Accuracy (after optim.): ", accuracy)
+        print("MSE (after optim.): ", MSE)
+        ######################################################
         
         # reconstruct optimized network tensors
         B.aggregate(axes_names=['d'+str(l),'left'], new_ax_name='i')
