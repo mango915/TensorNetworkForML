@@ -36,7 +36,7 @@ class Tensor():
     heuristic factor sqrt(# elems/2) - KEEP IT UPDATED
     """
     
-    def __init__(self, elem=None, shape=None, axes_names=None, sigma=1e-3):
+    def __init__(self, elem=None, shape=None, axes_names=None, scale=1.):
         """
         Parameters
         ----------
@@ -60,14 +60,8 @@ class Tensor():
         """
         # Numeric initialization
         if (elem is None) and (shape is not None):
-            #self.elem = np.random.normal(scale=sigma, size=shape)
             self.elem = np.random.random(size=shape) # uniform in [0,1]
-            fact = np.sqrt(self.elem.flatten().shape[0])
-            #print("fact")
-            #print(fact)
-            self.elem /= fact/np.sqrt(2) # heuristic normalization
-            #self.elem /= np.abs(self.elem).sum()
-            #self.elem *= 6
+            self.elem /= scale 
         elif elem is not None:
             self.elem = elem
         else:
@@ -507,6 +501,11 @@ def tensor_svd(T, threshold=0.999):
     if len(T.shape) != 2:
         raise ValueError("This function only support a 2D tensors")
 
+    debug = False
+    if debug:
+        print('\nSVD debug: ', debug)
+        print('T.elem.shape: ', T.elem.shape)
+        print('T.elem.sum(): ', T.elem.sum())
     # perform SVD of T elements
     U, S, Vh = np.linalg.svd(copy.deepcopy(T.elem))
 
@@ -515,14 +514,32 @@ def tensor_svd(T, threshold=0.999):
     #print(cumulative_variance_explained)
     index = np.argmax(cumulative_variance_explained>threshold)
     m = T.aggregations['i']['left']
-    m_new = max(10,min(index,m))
-    
+    if debug:
+        print('m: ', m)
+    #####################################
+    #m_new = max(10,min(index,m))
+    m_new = m # debug
+    #####################################
     # truncate tensors according to the new bond dimension
     Vh = Vh[:m_new,:]
     U = U[:,:m_new]
-    S = S[:m_new]
-    SVh = Vh*S[:,new] # new is np.newaxis
+    S = np.eye(m_new,m_new)*S[:m_new]
+    SVh = np.dot(S, Vh) # new is np.newaxis
     
+    T_new = np.dot(U,SVh)
+    
+    if debug:
+        print('T_new.shape: ', T_new.shape)
+        print('T_new.sum(): ', T_new.sum())
+        print('U.shape', U.shape)
+        print('U.sum', U.sum())
+        print('S.shape', S.shape)
+        print('S.sum', S.sum())
+        print('Vh.shape', Vh.shape)
+        print('Vh.sum', Vh.sum())
+        print('SVh.shape', SVh.shape)
+        print('SVh.sum', SVh.sum())
+        
     # building new tensors
     TU = Tensor(elem=U, axes_names=['i','right'])
     TSVh = Tensor(elem=SVh, axes_names=['left','j'])
@@ -549,6 +566,11 @@ class Network():
         embedding dimension)
     L: int
         Number of possible labels
+    M: int
+        Initial bond dimension
+    normalize: bool 
+        If True, normalizes the weights so that the expected output is of order 1
+        for inputs X with all entries in [0,1]   
     As: list of Tensors
         List of matrix-like tensors of the MPS network
     l_pos: int
@@ -580,7 +602,7 @@ class Network():
     where all the tensors are contracted both to the left and to the right.
     """
     
-    def __init__(self, N, M, D=2, L=10, sigma=1e-2):
+    def __init__(self, N, M, D=2, L=10, normalize=False):
         """
         Parameters
         ----------
@@ -591,23 +613,49 @@ class Network():
             embedding dimension)
         L: int
             Number of possible labels
-        sigma: float 
-            Not implemented
-            
-       
+        M: int
+            Initial bond dimension
+        normalize: bool 
+            If True, normalizes the weights so that the expected output is of order 1
+            for inputs X with all entries in [0,1]
         """
+        
         self.N = N
         self.D = D
         self.L = L
+        self.M = M
         
         self.As = []
         
-        # sigma as keyword should be removed if uniform initialization is used
-        self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0'], sigma=sigma))
-        for i in range(1,N):
-            self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)], sigma=sigma))
+        if normalize:
+            print('Normalizing weights...')
+            K = (self.D*self.N)**(-1./self.N)
+            print('K', K)
+            scale = float(self.M)/(3*K)
+            print('Scaling factor: %.2f'%scale)
+            self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0'], scale = scale))
+            for i in range(1,N):
+                self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)], scale = scale))
+        else:
+            self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0']))
+            for i in range(1,N):
+                self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)]))
+                
         self.l_pos = 0
         
+        if normalize:
+            B = 16
+            X = np.random.random((B, self.N, self.D))
+            f = self.forward(X)
+            f_max = np.abs(f.elem).max().astype('float')
+            print('f_max for random input of %d samples : '%(B),f_max)
+            F2 = f_max**(1./self.N)
+            for i in range(self.N):
+                self.As[i].elem = self.As[i].elem/F2
+            f = self.forward(X)  
+            f_max = np.abs(f.elem).max().astype('float')
+            print('f_max for random input of %d samples (after): '%(B),f_max)
+            
         return
         
     def forward(self, X):
@@ -695,11 +743,8 @@ class Network():
             # train
             print_every = int(len(train_loader)/print_freq)
             for i, data in enumerate(train_loader, 0):
-            #for i in tnrange(len(train_loader)):
-            #    data = train_loader[i]
                 x = np.array([data[i][0] for i in range(len(data))])
                 y = np.array([data[i][1] for i in range(len(data))])
-                #print("x.shape, y.shape:", x.shape, y.shape) # debug
                 f = self.sweep(x, y, lr)
                 batch_acc = self.accuracy(x, y, f)
                 epoch_train_acc[i] = batch_acc
@@ -775,19 +820,15 @@ class Network():
         """
         
         batch_size = len(y)
-        f = self.forward(X, train = True)
-        y_pred = np.argmax(f.elem, axis=0)
-        #print(y_pred)
-        #print(y)
+        f = self.forward(X)
+
+        #print("Target: \n", y)
         one_hot_y = np.zeros((y.size, self.L))
         one_hot_y[np.arange(y.size),y] = 1
         y = one_hot_y.T
         
-        
-        # compute accuracy
-        
-        
         for i in range(self.N-1):
+            #print("\nsweep step ",i)
             f = self.sweep_step(f, y, lr, batch_size)
             
         # svd 
@@ -797,9 +838,7 @@ class Network():
         B.aggregate(axes_names=['d0','right','l'], new_ax_name='j')
         B.transpose(['i','j'])
         self.As[-1], self.As[0] = tensor_svd(B)
-        #print("self.As[-1]: \n", self.As[-1])
-        #print("self.As[0]: \n", self.As[0])
-        
+
         self.l_pos = 0
         return f
     
@@ -848,17 +887,13 @@ class Network():
         elif (l > 0) and (l<(self.N-2)):
             # compute new term for the left contribute
             new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
-            #print("new_contribution: \n", new_contribution)
             if l==1:
                 # define left_contraction (['right','b'])
                 self.left_contraction = new_contribution
             else:
                 # update left_contraction (['right','b'])
                 self.left_contraction = contract(self.left_contraction, new_contribution, 'right', 'left', common='b')
-            #print("self.left_contraction: \n", self.left_contraction)
-            #print('self.cum_contraction[l+2]: \n', self.cum_contraction[l+2])
             circle_contraction = contract(self.cum_contraction[l+2], self.left_contraction, 'right', 'left', common='b')
-            #print("circle_contraction: \n", circle_contraction)
             # tensor product with broadcasting on batch axis
             phi = contract(phi, circle_contraction, common = "b")
             
@@ -871,23 +906,30 @@ class Network():
             # tensor product with broadcasting on batch axis
             phi = contract(phi, self.left_contraction, common = "b")
             
+        y_pred = np.argmax(f.elem, axis=0) 
+        #print('Predictions before sweep step: \n', y_pred) 
+        #print('f.elem.shape: ', f.elem.shape)
+        #print('y.shape: ', y.shape)
         f.elem = y-f.elem
-        #print("phi: \n",phi)
+        #print('(y-f).elem.shape: ', f.elem.shape)
         deltaB = contract(f, phi, contracted="b")
-        deltaB.elem *= (lr/batch_size)
-        #print("Before SVD")
-        #print("self.As[%d]: \n"%(l), self.As[l])
-        #print("self.As[%d]: \n"%(l+1), self.As[l+1])
-        
-        #print("B: \n",B)
-        #print("deltaB :\n", deltaB)
+        # gradient clipping
+        if np.abs(deltaB.elem).sum() > 1000:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/1000
+        deltaB.elem *= lr
+
         left_index = deltaB.ax_to_index('left')
         right_index = deltaB.ax_to_index('right')
         deltaB.axes_names[left_index] = 'right'
         deltaB.axes_names[right_index] = 'left'
         # update B
+        debug = False
+        if debug:
+            print('\nB.elem.sum(): ', B.elem.sum())
+            print('deltaB.elem.sum(): ', deltaB.elem.sum())
         B = B + deltaB
-
+        if debug:
+            print('B.elem.sum() (after update): ', B.elem.sum())
         # compute new output of the net
         out = contract(B, self.TX[l], contracted='d'+str(l))
         out = contract(out, self.TX[l+1], contracted='d'+str(l+1), common='b')
@@ -901,14 +943,14 @@ class Network():
         
         out = partial_trace(out, 'right', 'left') # close the circle
         
+        y_pred = np.argmax(out.elem, axis=0) 
+        #print('Predictions after sweep step: \n', y_pred) 
+        
         # reconstruct optimized network tensors
         B.aggregate(axes_names=['d'+str(l),'left'], new_ax_name='i')
         B.aggregate(axes_names=['d'+str(l+1),'right','l'], new_ax_name='j')
         B.transpose(['i','j'])
         self.As[l], self.As[l+1] = tensor_svd(B)
-        #print("After SVD")
-        #print("self.As[%d]: \n"%(l), self.As[l])
-        #print("self.As[%d]: \n"%(l+1), self.As[l+1])
         
         # update position of l
         self.l_pos += 1
