@@ -631,9 +631,9 @@ class Network():
         
         if normalize:
             print('Normalizing weights...')
-            K = (self.D*self.N)**(-1./self.N)
-            print('K', K)
-            scale = float(self.M)/(3*K)
+            #K = (self.D*self.N)**(-1./self.N)
+            #print('K', K)
+            scale = float(self.M)*0.5*0.64*self.D
             print('Scaling factor: %.2f'%scale)
             self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0'], scale = scale))
             for i in range(1,N):
@@ -656,7 +656,7 @@ class Network():
                 X = psi(X)
             else:
                 X = calibration_X
-                B = X.shape[2]
+                B = X.shape[0]
             
             print(X.shape)
             f = self.forward(X)
