@@ -463,7 +463,7 @@ def partial_trace(T, ax1, ax2):
 
 
 
-def tensor_svd(T, threshold=0.999):
+def tensor_svd(T, threshold=0.999, inverse=False):
     """
     Performs Singular Value Decomposition (SVD) on a 2D Tensor
     
@@ -509,6 +509,7 @@ def tensor_svd(T, threshold=0.999):
     # perform SVD of T elements
     U, S, Vh = np.linalg.svd(copy.deepcopy(T.elem))
 
+    #print("S.sum(): ", S.sum())
     # compute adaptive bond dimension
     cumulative_variance_explained = np.cumsum(S)/S.sum()
     #print(cumulative_variance_explained)
@@ -519,38 +520,58 @@ def tensor_svd(T, threshold=0.999):
     #####################################
     #m_new = max(10,min(index,m))
     m_new = m # debug
+    #print('SVD precision: ', cumulative_variance_explained[m-1])
     #####################################
     # truncate tensors according to the new bond dimension
     Vh = Vh[:m_new,:]
     U = U[:,:m_new]
-    S = np.eye(m_new,m_new)*S[:m_new]
-    SVh = np.dot(S, Vh) # new is np.newaxis
+    S = np.eye(m_new, m_new)*S[:m_new]
+    Sqrt = np.sqrt(S)
     
-    T_new = np.dot(U,SVh)
+    if inverse is False:
+        #SVh = np.dot(S, Vh) # new is np.newaxis
+        SVh = np.dot(Sqrt, Vh)
+        U = np.dot(U,Sqrt)
+        if debug:
+            T_new = np.dot(U,SVh)
+            print('T_new.shape: ', T_new.shape)
+            print('T_new.sum(): ', T_new.sum())
+            print('U.shape', U.shape)
+            print('U.sum', U.sum())
+            print('S.shape', S.shape)
+            print('S.sum', S.sum())
+            print('Vh.shape', Vh.shape)
+            print('Vh.sum', Vh.sum())
+            print('SVh.shape', SVh.shape)
+            print('SVh.sum', SVh.sum())
+            
+        # building new tensors
+        TU = Tensor(elem=U, axes_names=['i','right'])
+        TSVh = Tensor(elem=SVh, axes_names=['left','j'])
+        TU.aggregations['i'] = T.aggregations['i']
+        TSVh.aggregations['j'] = T.aggregations['j']
+
+        # retrieving original dimensions
+        TU.disaggregate('i')
+        TSVh.disaggregate('j')
+
+        return TU, TSVh
     
-    if debug:
-        print('T_new.shape: ', T_new.shape)
-        print('T_new.sum(): ', T_new.sum())
-        print('U.shape', U.shape)
-        print('U.sum', U.sum())
-        print('S.shape', S.shape)
-        print('S.sum', S.sum())
-        print('Vh.shape', Vh.shape)
-        print('Vh.sum', Vh.sum())
-        print('SVh.shape', SVh.shape)
-        print('SVh.sum', SVh.sum())
-        
-    # building new tensors
-    TU = Tensor(elem=U, axes_names=['i','right'])
-    TSVh = Tensor(elem=SVh, axes_names=['left','j'])
-    TU.aggregations['i'] = T.aggregations['i']
-    TSVh.aggregations['j'] = T.aggregations['j']
-    
-    # retrieving original dimensions
-    TU.disaggregate('i')
-    TSVh.disaggregate('j')
-    
-    return TU, TSVh
+    else:
+        #US = np.dot(U,S)
+        US = np.dot(U,Sqrt)
+        SVh = np.dot(Sqrt, Vh)
+        # building new tensors
+        TUS = Tensor(elem=US, axes_names=['i','right'])
+        TSVh = Tensor(elem=SVh, axes_names=['left','j'])
+        TUS.aggregations['i'] = T.aggregations['i']
+        TSVh.aggregations['j'] = T.aggregations['j']
+
+        # retrieving original dimensions
+        TUS.disaggregate('i')
+        TSVh.disaggregate('j')
+
+        return TUS, TSVh#, cumulative_variance_explained[m-1]
 
 
 class Network():
@@ -578,14 +599,14 @@ class Network():
     TX: list of Tensors
         Object to wrap the input as a list of Tensors in order to perform
         contractions with the As
-    cum_contraction: list of Tensors
+    r_cum_contraction: list of Tensors
         List of cumulative contractions from the "right" to the "left" of the network
         Calling A_TX the list of the contracted tensors As[i] TX[i], the first element 
         of cum_contraction is A_TX[-1], then the second is the contraction of A_TX[-1]
         and A_TX[-2], the third the contraction of cum_contraction[1] with A_TX[-3] 
         and so on
-    left_contraction: Tensor
-        Cumulative contractions from the "right" to the "left" of the network
+    l_cum_contraction: list of Tensor
+        List of cumulative contractions from the "left" to the "right" of the network
         
     Methods
     -------
@@ -598,7 +619,7 @@ class Network():
         
     Notes
     -----
-    This class implements a circular MPS Tensor Network, meaning that the network topology is a ring
+    CHANGE IT - This class implements a circular MPS Tensor Network, meaning that the network topology is a ring
     where all the tensors are contracted both to the left and to the right.
     """
     
@@ -619,7 +640,7 @@ class Network():
             If True, normalizes the weights so that the expected output is of order 1
             for inputs X with all entries in [0,1]
         calibration_X: numpy array
-            Shape (batch_size, N, D)
+            Sample of shape (batch_size, N, D) used to calibrate the weights of the network before training
         """
         
         self.N = N
@@ -631,50 +652,54 @@ class Network():
         
         if normalize:
             print('Normalizing weights...')
-            #K = (self.D*self.N)**(-1./self.N)
-            #print('K', K)
+            # output goes like [M E(A) E(x) D]^N
+            # E(A) expected value of entry A (tensor) distributed uniformly in [0,1] -> 0.5
+            # E(x) expected value of x = cos(pi/2 * u) (or sin(pi/2 * u)), u in [0,1] -> 0.64
             scale = float(self.M)*0.5*0.64*self.D
             print('Scaling factor: %.2f'%scale)
+            
             self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0'], scale = scale))
             for i in range(1,N):
                 self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)], scale = scale))
-        else:
-            self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0']))
-            for i in range(1,N):
-                self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)]))
                 
-        self.l_pos = 0
-        
-        if normalize:
             if calibration_X is None:
-                B = 16 # batch size of the samples used for calibration
-                X = np.random.random((B, self.N))
-                print(X.shape)
+                # if calibration input not provided, create one from scratch
                 def psi(x):
+                    """Embedding function """
                     x = np.array((np.sin(np.pi*x/2),np.cos(np.pi*x/2)))
                     return np.transpose(x, [1,2,0])
+                
+                B = 16 # batch size of the samples used for calibration
+                X = np.random.random((B, self.N))
                 X = psi(X)
+                
             else:
                 X = calibration_X
                 B = X.shape[0]
             
-            print(X.shape)
+            print('Calibrating weights on dataset...')
+
+            # compute the order of magnitude of the output
             f = self.forward(X)
             f_max = np.abs(f.elem).max().astype('float')
             print('f_max for random input of %d samples : '%(B),f_max)
-            F2 = f_max**(1./self.N)
-            print("F2: ", F2)
-            sum_of_A = 0 # debug
-            for i in range(self.N):
-                #self.As[i].elem = copy.deepcopy(self.As[i].elem)/F2
-                self.As[i].elem = self.As[i].elem/F2
-                sum_of_A += self.As[i].elem.sum() # debug
-            print("Sum of all elements of all As (after init): ", sum_of_A) # debug
+            F2 = f_max**(1./self.N) # factor for rescaling
+            print("Rescaling factor for calibration: ", F2)
+           
+            # compute the new order of magnitude of the output (should be 1)
             f = self.forward(X)  
             f_max = np.abs(f.elem).max().astype('float')
             print('f_max for random input of %d samples (after): '%(B),f_max)
             
-            
+        else:
+            # without normalization each entry of each A is a random number in [0,1]
+            self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0']))
+            for i in range(1,N):
+                self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)]))
+        
+        # position of the tensor with additional dimension for the output of the net
+        self.l_pos = 0
+
         return
         
     def forward(self, X):
@@ -713,27 +738,20 @@ class Network():
         #     * multithread
                       
         #A_TX = np.vectorize(contract)(TX, A, contracted='d'+str(i))
-        
-        ##############################################################################
-        #sum_of_A = 0 # debug
-        #for i in range(self.N):
-        #        sum_of_A += self.As[i].elem.sum() # debug
-        #print("Sum of all elements of all As (before forward): ", sum_of_A) # debug
-        ##############################################################################
-        
+   
         A_TX = [contract(self.As[i], TX[i], contracted='d'+str(i)) for i in range(self.N)]
         cum_contraction = []
         cum_contraction.append(A_TX[-1])
-        for j in range(1,self.N): # instead of self.N - 1
+        for j in range(1,self.N): 
             tmp_cum = copy.deepcopy(cum_contraction[-1])
             tmp_cum = contract(A_TX[-(j+1)], tmp_cum, 'right', 'left', common='b')
             cum_contraction.append(tmp_cum)
 
-        self.cum_contraction = cum_contraction[::-1]
+        self.r_cum_contraction = cum_contraction[::-1]
         self.left_contraction = None
         self.TX = TX
 
-        out = partial_trace(self.cum_contraction[0], 'right', 'left') # close the circle
+        out = partial_trace(self.r_cum_contraction[0], 'right', 'left') # close the circle
         return out
 
     def train(self, train_loader, val_loader, lr, n_epochs = 10, early_stopping = False, print_freq = 100):
@@ -771,31 +789,35 @@ class Network():
             print_every = int(len(train_loader)/print_freq)
             for i, data in enumerate(train_loader, 0):
                 x = np.array([data[i][0] for i in range(len(data))])
-                #f_debug = self.forward(x)
-                #print("f_debug.elem: ", f_debug.elem)  # incorrect of 10^-11 order
                 y = np.array([data[i][1] for i in range(len(data))])
-                f = self.sweep(x, y, lr)
-                batch_acc = self.accuracy(x, y, f)
+                
+                f = self.forward(x)
+                batch_acc = self.accuracy(x, y, f) # compute accuracy before batch optimization
+                f = self.sweep(x, y, f, lr)
+                ##################################################################################
+                batch_acc_opt = self.accuracy(x, y, f) # compute accuracy after batch optimization
+                print('batch_acc: ', batch_acc)
+                print('batch_acc_opt: ', batch_acc_opt)
+                ##################################################################################
                 epoch_train_acc[i] = batch_acc
+                
                 if (i+1) % (print_every) == 0:
-                    print('\r'+"Epoch %d - train accuracy : %.4f - completed : %.2f "%(epoch, epoch_train_acc[:i].mean(), (i+1)*100/len(train_loader))+'%', end=' ')
+                    print('\r'+"Epoch %d - train accuracy : %.4f - completed : %.2f "%(epoch, epoch_train_acc[i], (i+1)*100/len(train_loader))+'%', end=' ')
+                    
             train_acc.append(epoch_train_acc.mean())
             
             # validation
-            epoch_val_acc = np.zeros(len(train_loader))
-            batch_len = np.zeros(len(train_loader))
+            epoch_val_acc = np.zeros(len(val_loader))
             for i, data in enumerate(val_loader, 0):
                 x = np.array([data[i][0] for i in range(len(data))])
                 y = np.array([data[i][1] for i in range(len(data))])
                 batch_acc = self.accuracy(x, y)
                 epoch_val_acc[i] = batch_acc
-                batch_len[i] = len(x)
-                if (i+1) % (print_every) == 0:
-                    tmp_val_acc = epoch_val_acc[:i].sum()/batch_len[:i].sum()
-                    print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], tmp_val_acc), end=' ')
-
-            epoch_val_acc *= batch_len
-            val_acc.append(epoch_val_acc.sum()/batch_len.sum())
+                #if (i+1) % (print_every) == 0:
+                #    tmp_val_acc = epoch_val_acc[:i].mean()
+                #    print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], tmp_val_acc), end=' ')
+                    
+            val_acc.append(epoch_val_acc.mean())
             print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], val_acc[-1]))
         
         return train_acc, val_acc
@@ -828,7 +850,7 @@ class Network():
         accuracy = (len(y_pred)-errors)/len(y_pred)
         return accuracy
     
-    def sweep(self, X, y, lr):
+    def sweep(self, X, y, f, lr):
         """
         Makes an optimization "sweep", consisting of optimizing each pair
         of adjacent Tensors As[i] As[i+1]
@@ -839,6 +861,8 @@ class Network():
             Shape (batch_size, N, D) (see init parameters for better explanation)
         y: numpy array of int
             Prediction targets of shape (batch_size,)
+        f: Tensor
+            Result of net.forward(X)
         lr: float in (0,1]
             Learning rate that multiplies the gradient
             
@@ -849,36 +873,28 @@ class Network():
         """
         
         batch_size = len(y)
-        f = self.forward(X)
-        #print("Target: \n", y)
+
+        # compute one hot encoding of the target
         one_hot_y = np.zeros((y.size, self.L))
         one_hot_y[np.arange(y.size),y] = 1
         y = one_hot_y.T
         
-        for i in range(self.N-1):
-            print("\nsweep step ",i)
-            f = self.sweep_step(f, y, lr, batch_size)
-            ####################
-            #sum_of_A = 0 # debug
-            #for i in range(self.N):
-            #        sum_of_A += self.As[i].elem.sum() # debug
-            #print("Sum of all elements of all As (before forward): ", sum_of_A) # debug
-            ####################
-            
-        ### ERROR IN THIS PART ###
-        # svd 
-        B = contract(self.As[-1], self.As[0], "right", "left")
-        # reconstruct optimized network tensors
-        B.aggregate(axes_names=['d'+str(self.l_pos),'left'], new_ax_name='i')
-        B.aggregate(axes_names=['d0','right','l'], new_ax_name='j')
-        B.transpose(['i','j'])
-        self.As[-1], self.As[0] = tensor_svd(B)
-        ##########################
         
-        self.l_pos = 0
+        self.l_cum_contraction = [] # init left cumulative contraction array
+        # sweep from left to right
+        for i in range(self.N-1):
+            #print("\nright sweep step ",i)
+            f = self.r_sweep_step(f, y, lr, batch_size)
+        
+        self.r_cum_contraction = [] # init right cumulative contraction array
+        # sweep from right to left
+        for i in range(self.N-1):
+            #print("\nleft sweep step ",self.N-1-i)
+            f = self.l_sweep_step(f, y, lr, batch_size)
+        
         return f
     
-    def sweep_step(self, f, y, lr, batch_size):
+    def r_sweep_step(self, f, y, lr, batch_size):
         """
         Makes a step of the optimization "sweep", consisting in the optimization of
         a pair of Tensors As[i] As[i+1]
@@ -890,6 +906,8 @@ class Network():
         y: numpy array of int
             One hot encoded version of the prediction targets
             Shape is (batch_size,L)
+        lr: float in [0,1]
+            Learning rate
         batch_size: int
             Number of samples in a batch
             
@@ -902,45 +920,45 @@ class Network():
         # ID of the node A at which the output of the net is computed
         l = self.l_pos
         
-        # (always true)
-        B = contract(self.As[l], self.As[l+1], "right", "left")
-
-        # (always true)
+        B = contract(self.As[l], self.As[l+1], "right", "left")    
+        
         # computing all elements for delta_B
         # Contributions:
         # - TX[l]    (always))
         # - TX[l+1]    (always))
         # - left_contribution    (for l > 0)
-        # - cum_contraction[-(l+2)]    (for l < N-2)
+        # - r_cum_contraction[-(l+2)]    (for l < N-2)
         # - y-f    (always)
         
         phi = contract(self.TX[l], self.TX[l+1], common="b")
         
         if l==0:
             # tensor product with broadcasting on batch axis
-            phi = contract(phi, self.cum_contraction[l+2], common = "b")
+            phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
         
         elif (l > 0) and (l<(self.N-2)):
             # compute new term for the left contribute
             new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
             if l==1:
-                # define left_contraction (['right','b'])
-                self.left_contraction = new_contribution
+                # define l_cum_contraction (['right','b'])
+                self.l_cum_contraction.append(new_contribution)
             else:
-                # update left_contraction (['right','b'])
-                self.left_contraction = contract(self.left_contraction, new_contribution, 'right', 'left', common='b')
-            circle_contraction = contract(self.cum_contraction[l+2], self.left_contraction, 'right', 'left', common='b')
+                # update l_cum_contraction (['right','b'])
+                tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
+                self.l_cum_contraction.append(tmp) 
+            circle_contraction = contract(self.r_cum_contraction[l+2], self.l_cum_contraction[-1], 'right', 'left', common='b')
             # tensor product with broadcasting on batch axis
             phi = contract(phi, circle_contraction, common = "b")
             
         else:
             new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
             
-            # update left_contraction (['right','b'])
-            self.left_contraction = contract(self.left_contraction, new_contribution, 'right', 'left', common='b')
+            # update l_cum_contraction (['right','b'])
+            tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
+            self.l_cum_contraction.append(tmp) 
             
             # tensor product with broadcasting on batch axis
-            phi = contract(phi, self.left_contraction, common = "b")
+            phi = contract(phi, self.l_cum_contraction[-1], common = "b")
             
         ######################################################
         y_pred = np.argmax(f.elem, axis=0) 
@@ -951,47 +969,202 @@ class Network():
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
         MSE = ((y-f.elem)**2).mean()
-        print("Accuracy (before optim.): ", accuracy)
-        print("MSE (before optim.): ", MSE)
+        #print("Accuracy (before optim.): ", accuracy)
+        #print("MSE (before optim.): ", MSE)
         ######################################################
         
-        f.elem = y-f.elem
+        #print('f: ', np.abs(f.elem).sum()) # debug
+        f.elem = y-f.elem # overwrite f with (target - prediction)
   
         deltaB = contract(f, phi, contracted="b")
-        # gradient clipping
-        if np.abs(deltaB.elem).sum() > 1000:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/1000
-        deltaB.elem *= lr
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+        #print('DeltaB: ', np.abs(deltaB.elem).sum()) # debug
+        deltaB.elem *= lr # multiply gradient for learning rate
 
+        # change left and right indices 
         left_index = deltaB.ax_to_index('left')
         right_index = deltaB.ax_to_index('right')
         deltaB.axes_names[left_index] = 'right'
         deltaB.axes_names[right_index] = 'left'
-        # update B
-        debug = False
-        if debug:
-            print('\nB.elem.sum(): ', B.elem.sum())
-        print('deltaB.elem.sum(): ', deltaB.elem.sum())
+        
+        #print('B: \t', np.abs(B.elem).sum())
         # just trying to regularize
-        B.elem *= (1-lr)
-        B = B + deltaB
-        if debug:
-            print('B.elem.sum() (after update): ', B.elem.sum())
-        # compute new output of the net
+        #B.elem *= (1-lr)
+        B = B + deltaB # update B
+        #print('B.elem.sum() (after update): ', B.elem.sum())
+        
+        # compute new output of the net (out is like f, but with new A weights)
         out = contract(B, self.TX[l], contracted='d'+str(l))
         out = contract(out, self.TX[l+1], contracted='d'+str(l+1), common='b')
         if l == 0:
-            out = contract(out, self.cum_contraction[l+2], 'right', 'left', common = "b")
+            # no left term
+            out = contract(out, self.r_cum_contraction[l+2], 'right', 'left', common = "b")
         elif (l > 0) and (l<(self.N-2)):
-            out = contract(self.left_contraction, out, 'right', 'left', common = "b")
-            out = contract(out, self.cum_contraction[l+2], 'right', 'left', common = "b")
+            # both left and right term
+            out = contract(self.l_cum_contraction[-1], out, 'right', 'left', common = "b")
+            out = contract(out, self.r_cum_contraction[l+2], 'right', 'left', common = "b")
         else:
-            out = contract(self.left_contraction, out, 'right', 'left', common = "b")
+            # no right term
+            out = contract(self.l_cum_contraction[-1], out, 'right', 'left', common = "b")
         
         out = partial_trace(out, 'right', 'left') # close the circle
-        if debug:
-            print("Shape of the outputs: ", out.elem.shape)
-            print("Total sum of the outputs: ", np.abs(out.elem).sum())
+        
+        #print("f(B): ", np.abs(out.elem).sum())
+          
+        ######################################################
+        y_pred = np.argmax(out.elem, axis=0) 
+        #print("Prediction (after optim.): ", y_pred)
+        errors = (y_target!=y_pred).sum()
+        accuracy = (len(y_pred)-errors)/len(y_pred)
+        MSE = ((y-out.elem)**2).mean()
+        #print("Accuracy (after optim.): ", accuracy)
+        #print("MSE (after optim.): ", MSE)
+        ######################################################
+        
+        # reconstruct optimized network tensors
+        B.aggregate(axes_names=['d'+str(l),'left'], new_ax_name='i')
+        B.aggregate(axes_names=['d'+str(l+1),'right','l'], new_ax_name='j')
+        B.transpose(['i','j'])
+  
+        # use SVD to decompose B in As[l] and As[l+1]
+        # l dimension now is on As[l+1]
+        self.As[l], self.As[l+1] = tensor_svd(B)
+                
+        # update position of l to the right
+        self.l_pos += 1
+        
+        return out
+    
+    
+    def l_sweep_step(self, f, y, lr, batch_size):
+        """
+        Makes a step of the optimization "sweep", consisting in the optimization of
+        a pair of Tensors As[i] As[i+1]
+        
+        Parameters
+        ----------
+        f: Tensor
+            Equivalent to self.forward(X)
+        y: numpy array of int
+            One hot encoded version of the prediction targets
+            Shape is (batch_size,L)
+        lr: float in [0,1]
+            Learning rate
+        batch_size: int
+            Number of samples in a batch
+            
+        Returns
+        -------
+        f: Tensor
+            Equivalent to self.forward(X) after optimization step
+        """
+        
+        # ID of the node A at which the output of the net is computed
+        l = self.l_pos
+
+        B = contract(self.As[l-1], self.As[l], "right", "left")
+        
+        # (always true)
+        # computing all elements for delta_B
+        # Contributions:
+        # - TX[l]    (always))
+        # - TX[l+1]    (always))
+        # - left_contribution    (for l > 0)
+        # - r_cum_contraction[-(l+2)]    (for l < N-2)
+        # - y-f    (always)
+        
+        phi = contract(self.TX[l-1], self.TX[l], common="b")
+        
+        if l == self.N-1:
+            # tensor product with broadcasting on batch axis
+            phi = contract(phi, self.l_cum_contraction[-1], common = "b")
+            
+        elif (l > 1) and (l<(self.N-1)):
+            # compute new term for the right contribute
+            new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
+            
+            if l==self.N-2:
+                # define r_cum_contraction (['left','b'])
+                self.r_cum_contraction.append(new_contribution)
+            else:
+                # update r_cum_contraction (['left','b'])
+                tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
+                self.r_cum_contraction.append(tmp) 
+            circle_contraction = contract(self.r_cum_contraction[-1], self.l_cum_contraction[l-2], 'right', 'left', common='b')
+            # tensor product with broadcasting on batch axis
+            phi = contract(phi, circle_contraction, common = "b")
+            
+        elif l==1:
+            new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
+            tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
+            self.r_cum_contraction.append(tmp)
+            phi = contract(phi, self.r_cum_contraction[-1], common = "b")
+        else:
+            print('l: ', l)
+            print("This should not happen")           
+            
+        ######################################################
+        y_pred = np.argmax(f.elem, axis=0) 
+        y_target = np.argmax(y, axis=0) 
+        #print("Target: ", y_target)
+        #print("Prediction (before optim.): ", y_pred)
+        
+        errors = (y_target!=y_pred).sum()
+        accuracy = (len(y_pred)-errors)/len(y_pred)
+        MSE = ((y-f.elem)**2).mean()
+        #print("Accuracy (before optim.): ", accuracy)
+        #print("MSE (before optim.): ", MSE)
+        ######################################################
+        
+        #print('f: ', np.abs(f.elem).sum())
+        f.elem = y-f.elem  # overwrite f with (target - prediction)
+
+        deltaB = contract(f, phi, contracted="b")
+
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+        deltaB.elem *= lr
+
+        # change left and right indices 
+        left_index = deltaB.ax_to_index('left')
+        right_index = deltaB.ax_to_index('right')
+        deltaB.axes_names[left_index] = 'right'
+        deltaB.axes_names[right_index] = 'left'
+        
+        #print('B: \t', np.abs(B.elem).sum()), 
+        #print('deltaB: ', np.abs(deltaB.elem).sum())
+
+        # update B
+        B = B + deltaB
+        
+        print('B.elem.sum() (after update): ', B.elem.sum())
+            
+        # compute new output of the net (out is like f, but with new A weights)
+        out = contract(B, self.TX[l-1], contracted='d'+str(l-1))
+        out = contract(out, self.TX[l], contracted='d'+str(l), common='b')
+        
+        if l == self.N-1:
+            # no right term
+            out = contract(self.l_cum_contraction[-1], out, 'right', 'left', common = "b") # ok
+        
+        elif (l > 1) and (l<(self.N-1)):
+            # both right and left terms
+            out = contract(self.l_cum_contraction[l-2], out, 'right', 'left', common = "b") # ok
+            out = contract(out, self.r_cum_contraction[-1], 'right', 'left', common = "b") # ok
+            
+        else: # l=1 case
+            # only right case
+            out = contract(out, self.r_cum_contraction[-1], 'right', 'left', common = "b") 
+        
+        out = partial_trace(out, 'right', 'left') # close the circle
+        #print("f (old B): ", np.abs(out.elem).sum())
            
         ######################################################
         y_pred = np.argmax(out.elem, axis=0) 
@@ -999,22 +1172,24 @@ class Network():
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
         MSE = ((y-out.elem)**2).mean()
-        print("Accuracy (after optim.): ", accuracy)
-        print("MSE (after optim.): ", MSE)
+        #print("Accuracy (after optim.): ", accuracy)
+        #print("MSE (after optim.): ", MSE)
         ######################################################
-        
+
         # reconstruct optimized network tensors
-        B.aggregate(axes_names=['d'+str(l),'left'], new_ax_name='i')
-        B.aggregate(axes_names=['d'+str(l+1),'right','l'], new_ax_name='j')
+        B.aggregate(axes_names=['d'+str(l-1),'left','l'], new_ax_name='i')
+        B.aggregate(axes_names=['d'+str(l),'right'], new_ax_name='j')
         B.transpose(['i','j'])
-        self.As[l], self.As[l+1] = tensor_svd(B)
+   
+        # use SVD to decompose B in As[l-1] and As[l]
+        # l dimension now is on As[l-1]
+        self.As[l-1], self.As[l] = tensor_svd(B, inverse=True)
         
-        # update position of l
-        self.l_pos += 1
+        # update position of l to the left
+        self.l_pos -= 1
         
         return out
-    
-    
+     
         
     
         
