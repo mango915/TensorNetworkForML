@@ -623,7 +623,7 @@ class Network():
     where all the tensors are contracted both to the left and to the right.
     """
     
-    def __init__(self, N, M, D=2, L=10, normalize=False, calibration_X=None):
+    def __init__(self, N, M, D=2, L=10, T=0.1, L2=1e-2, normalize=False, calibration_X=None, act_fn='linear', loss_fn='MSE'):
         """
         Parameters
         ----------
@@ -636,17 +636,35 @@ class Network():
             Number of possible labels
         M: int
             Initial bond dimension
+        T: float
+            Temperature factor in the softmax e^{f_l/T}/sum_l e^{f_l/T}
         normalize: bool 
             If True, normalizes the weights so that the expected output is of order 1
             for inputs X with all entries in [0,1]
         calibration_X: numpy array
             Sample of shape (batch_size, N, D) used to calibrate the weights of the network before training
+        act_fn: str 
+            Specifies activation function to apply in the output. Possible choices: {'linear','sigmoid','softmax'}.
+            Default is 'linear'
+        loss_fn: str 
+            Specifies loss function for the output. Possible choices: {'MSE', 'cross_entropy', 'full_cross_ent'}.
+            Default is 'MSE'
         """
         
         self.N = N
         self.D = D
         self.L = L
         self.M = M
+        self.T = T # temperature 
+        self.L2 = L2 # L2 penalty
+        
+        possible_act_fn = ['linear', 'sigmoid', 'softmax']
+        assert act_fn in possible_act_fn, "Please select an activation function between 'linear', 'sigmoid', 'softmax'"
+        self.act_fn = act_fn
+        
+        possible_loss_fn = ['MSE', 'cross_entropy', 'full_cross_ent']
+        assert loss_fn in possible_loss_fn, "Please select a loss function between 'MSE', 'cross_entropy', 'full_cross_ent'"      
+        self.loss_fn = loss_fn
         
         self.As = []
         
@@ -685,7 +703,8 @@ class Network():
             print('f_max for random input of %d samples : '%(B),f_max)
             F2 = f_max**(1./self.N) # factor for rescaling
             print("Rescaling factor for calibration: ", F2)
-           
+            for i in range(self.N):
+                self.As[i].elem = self.As[i].elem/F2
             # compute the new order of magnitude of the output (should be 1)
             f = self.forward(X)  
             f_max = np.abs(f.elem).max().astype('float')
@@ -781,6 +800,9 @@ class Network():
         
         train_acc = []
         val_acc = []
+        B_log = []
+        dB_log = []
+        acc_log = []
         # if early_stopping = False
         for epoch in tnrange(n_epochs, desc="Epoch loop", leave = True):
             epoch_train_acc = np.zeros(len(train_loader))
@@ -792,18 +814,22 @@ class Network():
                 y = np.array([data[i][1] for i in range(len(data))])
                 
                 f = self.forward(x)
+               
                 batch_acc = self.accuracy(x, y, f) # compute accuracy before batch optimization
-                f = self.sweep(x, y, f, lr)
-                ##################################################################################
-                batch_acc_opt = self.accuracy(x, y, f) # compute accuracy after batch optimization
                 print('batch_acc: ', batch_acc)
-                print('batch_acc_opt: ', batch_acc_opt)
+                Bs, dBs, accs = self.sweep(x, y, f, lr)
+                B_log.append(Bs)
+                dB_log.append(dBs)
+                acc_log.append(accs)
+                ##################################################################################
+                #batch_acc_opt = self.accuracy(x, y, f) # compute accuracy after batch optimization
+                #print('batch_acc_opt: ', batch_acc_opt)
                 ##################################################################################
                 epoch_train_acc[i] = batch_acc
-                
-                if (i+1) % (print_every) == 0:
-                    print('\r'+"Epoch %d - train accuracy : %.4f - completed : %.2f "%(epoch, epoch_train_acc[i], (i+1)*100/len(train_loader))+'%', end=' ')
-                    
+                print("epoch_train_acc: ", epoch_train_acc)
+                #if (i+1) % (print_every) == 0:
+                #    print('\r'+"Epoch %d - train accuracy : %.4f - completed : %.2f "%(epoch, epoch_train_acc[i], (i+1)*100/len(train_loader))+'%', end=' ')
+            print("epoch_train_acc: ", epoch_train_acc)
             train_acc.append(epoch_train_acc.mean())
             
             # validation
@@ -811,18 +837,20 @@ class Network():
             for i, data in enumerate(val_loader, 0):
                 x = np.array([data[i][0] for i in range(len(data))])
                 y = np.array([data[i][1] for i in range(len(data))])
-                batch_acc = self.accuracy(x, y)
+                batch_acc = self.accuracy(x, y, debug=False)
                 epoch_val_acc[i] = batch_acc
+                print('batch_acc: ', batch_acc)
                 #if (i+1) % (print_every) == 0:
                 #    tmp_val_acc = epoch_val_acc[:i].mean()
                 #    print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], tmp_val_acc), end=' ')
-                    
+              
+            print("epoch_val_acc: ", epoch_val_acc)
             val_acc.append(epoch_val_acc.mean())
             print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], val_acc[-1]))
         
-        return train_acc, val_acc
+        return train_acc, val_acc, B_log, dB_log, acc_log
     
-    def accuracy(self, X, y, f=None):
+    def accuracy(self, X, y, f=None, debug=False, return_MAE=False):
         """
         Computes the accuracy of the networks' predictions
         
@@ -846,11 +874,35 @@ class Network():
         if f is None:
             f = self.forward(X)
         y_pred = np.argmax(f.elem, axis=0)
+        
         errors = (y!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        return accuracy
+
+        if debug:
+            print("Targets: ", y)
+            print("Predictions: ", y_pred)
+            print("Accuracy: ", accuracy)
+            
+        if return_MAE:
+            
+            activation = copy.deepcopy(f)
+            # self.act_fn = {'linear', 'sigmoid', 'softmax'}
+            if self.act_fn == 'linear':
+                pass # linear activation is identity transform on f
+            elif self.act_fn == 'sigmoid':
+                activation.elem = 1./(1.+np.exp(activation.elem)) # a = 1/(1+e^f)
+            elif self.act_fn == 'softmax':
+                label_axis = activation.ax_to_index('l')
+                #print('label_axis: ', label_axis)
+                activation.elem = np.exp(activation.elem/self.T)/np.exp(activation.elem/self.T).sum(axis=label_axis)
+                print("Activations for each sample: ", activation.elem)
+            
+            MAE = (np.abs(y-activation.elem)).mean()
+            return accuracy, MAE
+        else:
+            return accuracy
     
-    def sweep(self, X, y, f, lr):
+    def sweep(self, X, y, f, lr, normalize=False):
         """
         Makes an optimization "sweep", consisting of optimizing each pair
         of adjacent Tensors As[i] As[i+1]
@@ -881,18 +933,37 @@ class Network():
         
         
         self.l_cum_contraction = [] # init left cumulative contraction array
+        Bs = []
+        dBs = []
+        accs = []
         # sweep from left to right
         for i in range(self.N-1):
-            #print("\nright sweep step ",i)
-            f = self.r_sweep_step(f, y, lr, batch_size)
-        
+            print("\nright sweep step ",i)
+            f, B, dB, acc = self.r_sweep_step(f, y, lr, batch_size)
+            Bs.append(B)
+            dBs.append(dB)
+            accs.append(acc)
+            
         self.r_cum_contraction = [] # init right cumulative contraction array
         # sweep from right to left
         for i in range(self.N-1):
-            #print("\nleft sweep step ",self.N-1-i)
-            f = self.l_sweep_step(f, y, lr, batch_size)
-        
-        return f
+            print("\nleft sweep step ",self.N-1-i)
+            f, B, dB, acc = self.l_sweep_step(f, y, lr, batch_size)
+            Bs.append(B)
+            dBs.append(dB)
+            accs.append(acc)
+            
+        ### DEBUG 
+        print("Output values before normalization:\n", f.elem)
+            
+        if normalize: # it's not correct - NOT USED
+            print("Normalizing weights...")
+            f_max = np.abs(f.elem).max().astype('float')
+            F2 = f_max**(1./self.N) # factor for rescaling
+            for i in range(self.N):
+                self.As[i].elem = self.As[i].elem/F2
+                
+        return np.array(Bs), np.array(dBs), np.array(accs)
     
     def r_sweep_step(self, f, y, lr, batch_size):
         """
@@ -917,6 +988,9 @@ class Network():
             Equivalent to self.forward(X) after optimization step
         """
         
+        def abs_sum(T):
+            return np.abs(T.elem).sum()
+        
         # ID of the node A at which the output of the net is computed
         l = self.l_pos
         
@@ -931,11 +1005,11 @@ class Network():
         # - y-f    (always)
         
         phi = contract(self.TX[l], self.TX[l+1], common="b")
-        
+        #print("phi (TX): ", abs_sum(phi))
         if l==0:
             # tensor product with broadcasting on batch axis
             phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
-        
+            #print("right: ", abs_sum(self.r_cum_contraction[l+2]))
         elif (l > 0) and (l<(self.N-2)):
             # compute new term for the left contribute
             new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
@@ -947,6 +1021,7 @@ class Network():
                 tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
                 self.l_cum_contraction.append(tmp) 
             circle_contraction = contract(self.r_cum_contraction[l+2], self.l_cum_contraction[-1], 'right', 'left', common='b')
+            #print("circle: ", abs_sum(circle_contraction))
             # tensor product with broadcasting on batch axis
             phi = contract(phi, circle_contraction, common = "b")
             
@@ -956,42 +1031,82 @@ class Network():
             # update l_cum_contraction (['right','b'])
             tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
             self.l_cum_contraction.append(tmp) 
-            
+            #print("left: ", abs_sum(self.l_cum_contraction[-1]))
             # tensor product with broadcasting on batch axis
             phi = contract(phi, self.l_cum_contraction[-1], common = "b")
+        
+        print('f: ', abs_sum(f))
+        
+        activation = copy.deepcopy(f)
+        # self.act_fn = {'linear', 'sigmoid', 'softmax'}
+        if self.act_fn == 'linear':
+            pass # linear activation is identity transform on f
+        elif self.act_fn == 'sigmoid':
+            activation.elem = 1./(1.+np.exp(-activation.elem/self.T)) # a = 1/(1+e^-f)
+        elif self.act_fn == 'softmax':
+            label_axis = activation.ax_to_index('l')
+            #print('label_axis: ', label_axis)
+            activation.elem = np.exp(activation.elem/self.T)/np.exp(activation.elem/self.T).sum(axis=label_axis)
+            #print("Activations for each sample: ", activation.elem)
             
-        ######################################################
-        y_pred = np.argmax(f.elem, axis=0) 
+        print('activation: ', abs_sum(activation))
+        #####################################################
+        y_pred = np.argmax(activation.elem, axis=0) 
         y_target = np.argmax(y, axis=0) 
         #print("Target: ", y_target)
         #print("Prediction (before optim.): ", y_pred)
         
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-f.elem)**2).mean()
-        #print("Accuracy (before optim.): ", accuracy)
-        #print("MSE (before optim.): ", MSE)
+        #print("y ", y)
+        #print("act ", activation.elem)
+        #print("y - act ", y-activation.elem)
+        MSE = (np.abs(y-activation.elem)).mean()
+        print("Accuracy (before optim.): ", accuracy)
+        print("MAE (before optim.): ", MSE)
         ######################################################
         
-        #print('f: ', np.abs(f.elem).sum()) # debug
-        f.elem = y-f.elem # overwrite f with (target - prediction)
-  
-        deltaB = contract(f, phi, contracted="b")
-        # gradient clipping -> rescale all elements of the gradient so that the
-        # norm does not exceed the sum of the absolute values of B's entries
-        B_measure = np.abs(B.elem).sum()
-        if np.abs(deltaB.elem).sum() > B_measure:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
-        #print('DeltaB: ', np.abs(deltaB.elem).sum()) # debug
-        deltaB.elem *= lr # multiply gradient for learning rate
-
+        loss_der = copy.deepcopy(activation)
+        # self.loss_fn = {'MSE', 'cross_entropy', 'full_cross_ent'}
+        if self.loss_fn == 'ḾSE':
+            loss_der.elem = y - activation.elem
+        elif self.loss_fn == 'cross_entropy':
+            if self.act_fn == 'softmax':
+                print("softmax + cross entropy case")
+                loss_der.elem = (y - y*activation.elem)/self.T # simplyfied computations
+            #elif self.act_fn == 'sigmoid':
+            #    print("sigmoid + cross entropy case")
+            #    loss_der.elem = y*activation.elem*np.exp(-f.elem/self.T)/self.T # simplyfied computations
+            else:
+                loss_der.elem = y/activation.elem
+        elif self.loss_fn == 'full_cross_ent':
+            loss_der.elem[y == 0] = loss_der.elem[y == 0]  - 1
+            loss_der.elem = 1./(loss_der.elem+1e-4)
+        print('loss_der: ', abs_sum(loss_der))
+        
+        deltaB = contract(loss_der, phi, contracted="b")
         # change left and right indices 
         left_index = deltaB.ax_to_index('left')
         right_index = deltaB.ax_to_index('right')
         deltaB.axes_names[left_index] = 'right'
         deltaB.axes_names[right_index] = 'left'
+        deltaB.transpose(B.axes_names)
         
-        #print('B: \t', np.abs(B.elem).sum())
+        deltaB.elem -= self.L2*B.elem # L2 loss contrib
+        
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        dB_measure = np.abs(deltaB.elem).sum()
+        print('DeltaB (before GC): ', np.abs(deltaB.elem).sum()) # debug
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+        print('DeltaB (after GC): ', np.abs(deltaB.elem).sum()) # debug
+        deltaB.elem *= lr # multiply gradient for learning rate
+
+       
+        
+        print('B: \t', np.abs(B.elem).sum())
         # just trying to regularize
         #B.elem *= (1-lr)
         B = B + deltaB # update B
@@ -1014,15 +1129,29 @@ class Network():
         out = partial_trace(out, 'right', 'left') # close the circle
         
         #print("f(B): ", np.abs(out.elem).sum())
-          
+        activation1 = copy.deepcopy(out)
+        if self.act_fn == 'linear':
+            pass # linear activation is identity transform on f
+        elif self.act_fn == 'sigmoid':
+            activation1.elem = 1./(1.+np.exp(-activation1.elem)) # a = 1/(1+e^f)
+        elif self.act_fn == 'softmax':
+            label_axis = activation1.ax_to_index('l')
+            #print('label_axis: ', label_axis)
+            activation1.elem = np.exp(activation1.elem/self.T)/np.exp(activation1.elem/self.T).sum(axis=label_axis)
+            #print("Activations for each sample: ", activation.elem)
+            
         ######################################################
-        y_pred = np.argmax(out.elem, axis=0) 
+        y_pred = np.argmax(activation1.elem, axis=0) 
         #print("Prediction (after optim.): ", y_pred)
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-out.elem)**2).mean()
-        #print("Accuracy (after optim.): ", accuracy)
-        #print("MSE (after optim.): ", MSE)
+        #print("f ", out.elem)
+        #print("y ", y)
+        #print("act ", activation1.elem)
+        #print("y - act ", y-activation1.elem)
+        MSE = (np.abs(y-activation1.elem)).mean()
+        print("Accuracy (after optim.): ", accuracy)
+        print("MAE (after optim.): ", MSE)
         ######################################################
         
         # reconstruct optimized network tensors
@@ -1037,7 +1166,7 @@ class Network():
         # update position of l to the right
         self.l_pos += 1
         
-        return out
+        return out, B_measure, dB_measure, accuracy # this accuracy is AFTER optimization
     
     
     def l_sweep_step(self, f, y, lr, batch_size):
@@ -1063,6 +1192,8 @@ class Network():
             Equivalent to self.forward(X) after optimization step
         """
         
+        def abs_sum(T):
+            return np.abs(T.elem).sum()
         # ID of the node A at which the output of the net is computed
         l = self.l_pos
 
@@ -1107,44 +1238,86 @@ class Network():
             print('l: ', l)
             print("This should not happen")           
             
-        ######################################################
-        y_pred = np.argmax(f.elem, axis=0) 
+        print('f: ', abs_sum(f))
+        
+        activation = copy.deepcopy(f)
+        # self.act_fn = {'linear', 'sigmoid', 'softmax'}
+        if self.act_fn == 'linear':
+            pass # linear activation is identity transform on f
+        elif self.act_fn == 'sigmoid':
+            activation.elem = 1./(1.+np.exp(-activation.elem)) # a = 1/(1+e^f)
+        elif self.act_fn == 'softmax':
+            label_axis = activation.ax_to_index('l')
+            #print('label_axis: ', label_axis)
+            activation.elem = np.exp(activation.elem/self.T)/np.exp(activation.elem/self.T).sum(axis=label_axis)
+            #print("Activations for each sample: ", activation.elem)
+            
+        print('activation: ', abs_sum(activation))
+        #####################################################
+        y_pred = np.argmax(activation.elem, axis=0) 
         y_target = np.argmax(y, axis=0) 
         #print("Target: ", y_target)
         #print("Prediction (before optim.): ", y_pred)
         
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-f.elem)**2).mean()
-        #print("Accuracy (before optim.): ", accuracy)
-        #print("MSE (before optim.): ", MSE)
+        
+        #print("y ", y)
+        #print("act ", activation.elem)
+        #print("y - act ", y-activation.elem)
+        MSE = (np.abs(y-activation.elem)).mean()
+        print("Accuracy (before optim.): ", accuracy)
+        print("MAE (before optim.): ", MSE)
         ######################################################
         
-        #print('f: ', np.abs(f.elem).sum())
-        f.elem = y-f.elem  # overwrite f with (target - prediction)
-
-        deltaB = contract(f, phi, contracted="b")
-
-        # gradient clipping -> rescale all elements of the gradient so that the
-        # norm does not exceed the sum of the absolute values of B's entries
-        B_measure = np.abs(B.elem).sum()
-        if np.abs(deltaB.elem).sum() > B_measure:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
-        deltaB.elem *= lr
-
+        loss_der = copy.deepcopy(activation)
+        # self.loss_fn = {'MSE', 'cross_entropy', 'full_cross_ent'}
+        if self.loss_fn == 'ḾSE':
+            loss_der.elem = y - activation.elem
+        elif self.loss_fn == 'cross_entropy':
+            if self.act_fn == 'softmax':
+                print("softmax + cross entropy case")
+                loss_der.elem = (y - y*activation.elem)/self.T # simplyfied computations
+            #elif self.act_fn == 'sigmoid':
+            #    print("sigmoid + cross entropy case")
+            #    loss_der.elem = y*activation.elem*np.exp(-f.elem/self.T)/self.T # simplyfied computations
+            else:
+                loss_der.elem = y/activation.elem
+        elif self.loss_fn == 'full_cross_ent':
+            loss_der.elem[y == 0] = loss_der.elem[y == 0]  - 1
+            loss_der.elem = 1./(loss_der.elem+1e-4)
+        print('loss_der: ', abs_sum(loss_der))
+        
+        deltaB = contract(loss_der, phi, contracted="b")
         # change left and right indices 
         left_index = deltaB.ax_to_index('left')
         right_index = deltaB.ax_to_index('right')
         deltaB.axes_names[left_index] = 'right'
         deltaB.axes_names[right_index] = 'left'
+        deltaB.transpose(B.axes_names)
         
-        #print('B: \t', np.abs(B.elem).sum()), 
-        #print('deltaB: ', np.abs(deltaB.elem).sum())
+        deltaB.elem -= self.L2*B.elem 
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        print('deltaB (before GC): ', np.abs(deltaB.elem).sum())
+        B_measure = np.abs(B.elem).sum()
+        dB_measure = np.abs(deltaB.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+        print('deltaB (after GC): ', np.abs(deltaB.elem).sum())
+        deltaB.elem *= lr
+
+        
+        
+        
+        print('B: \t', np.abs(B.elem).sum()), 
+        
 
         # update B
+        #B.elem *= (1-lr)
         B = B + deltaB
         
-        print('B.elem.sum() (after update): ', B.elem.sum())
+        #print('B.elem.sum() (after update): ', B.elem.sum())
             
         # compute new output of the net (out is like f, but with new A weights)
         out = contract(B, self.TX[l-1], contracted='d'+str(l-1))
@@ -1166,14 +1339,30 @@ class Network():
         out = partial_trace(out, 'right', 'left') # close the circle
         #print("f (old B): ", np.abs(out.elem).sum())
            
+        #print("f(B): ", np.abs(out.elem).sum())
+        activation1 = copy.deepcopy(out)
+        if self.act_fn == 'linear':
+            pass # linear activation is identity transform on f
+        elif self.act_fn == 'sigmoid':
+            activation1.elem = 1./(1.+np.exp(-activation1.elem)) # a = 1/(1+e^f)
+        elif self.act_fn == 'softmax':
+            label_axis = activation1.ax_to_index('l')
+            #print('label_axis: ', label_axis)
+            activation1.elem = np.exp(activation1.elem/self.T)/np.exp(activation1.elem/self.T).sum(axis=label_axis)
+            #print("Activations for each sample: ", activation.elem)
+            
         ######################################################
-        y_pred = np.argmax(out.elem, axis=0) 
+        y_pred = np.argmax(activation1.elem, axis=0) 
         #print("Prediction (after optim.): ", y_pred)
-        errors = (y_target!=y_pred).sum()
+        #errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-out.elem)**2).mean()
-        #print("Accuracy (after optim.): ", accuracy)
-        #print("MSE (after optim.): ", MSE)
+        #print("f ", out.elem)
+        #print("y ", y)
+        #print("act ", activation1.elem)
+        #print("y - act ", y-activation1.elem)
+        MSE = np.abs(y-activation1.elem).mean()
+        print("Accuracy (after optim.): ", accuracy)
+        print("MAE (after optim.): ", MSE)
         ######################################################
 
         # reconstruct optimized network tensors
@@ -1188,7 +1377,7 @@ class Network():
         # update position of l to the left
         self.l_pos -= 1
         
-        return out
+        return out, B_measure, dB_measure, accuracy
      
         
     
